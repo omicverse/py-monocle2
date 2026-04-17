@@ -111,6 +111,25 @@ All timings on a single Intel Xeon node with 8 BLAS threads; correlations comput
 
 ---
 
+## Notebooks
+
+All notebooks are executed and ship with outputs committed, so you can
+browse them on GitHub without running anything.
+
+| Notebook | What it covers | Backend |
+|---|---|---|
+| [`examples/tutorial_quickstart_paul15.ipynb`](examples/tutorial_quickstart_paul15.ipynb) | Minimal end-to-end trajectory analysis using only `monocle2_py` on `scanpy.datasets.paul15`. Good starting point. | `from monocle2_py import Monocle` |
+| [`examples/tutorial_hsmm.ipynb`](examples/tutorial_hsmm.ipynb) | Full tutorial on HSMM myoblast data (the classical Monocle paper dataset). | `from omicverse.single import Monocle` |
+| [`examples/tutorial_olsson.ipynb`](examples/tutorial_olsson.ipynb) | Olsson hematopoietic differentiation trajectory. | `from omicverse.single import Monocle` |
+| [`examples/tutorial_pancreas.ipynb`](examples/tutorial_pancreas.ipynb) | Pancreatic endocrinogenesis (3 696 cells × 28 k genes) — the large-scale demo used for the benchmark table below. | `from omicverse.single import Monocle` |
+| [`examples/benchmark_vs_R.ipynb`](examples/benchmark_vs_R.ipynb) | Live `exact` vs `fast` timing on `paul15` plus R Monocle 2 reference numbers for HSMM / Olsson / pancreas / 143 k neuroectoderm. | both |
+
+The three dataset tutorials (`tutorial_hsmm`, `tutorial_olsson`,
+`tutorial_pancreas`) are the canonical ones used during development of
+this port — they drive via `omicverse.single.Monocle`, which is the
+exact same Monocle class you get here via `from monocle2_py import
+Monocle`. Either entrypoint works; the code path is identical.
+
 ## Relationship to omicverse
 
 This package is developed **upstream** in [`omicverse`](https://github.com/Starlitnightly/omicverse):
