@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "monocle2-py"
+version = "0.1.0"
+description = "Pure-Python Monocle 2 — single-cell trajectory inference, AnnData-native."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Zehua Zeng", email = "starlitnightly@163.com" },
+]
+keywords = [
+    "single-cell", "scRNA-seq", "trajectory", "pseudotime",
+    "monocle2", "DDRTree", "BEAM", "scanpy", "anndata",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+
+dependencies = [
+    "numpy>=1.23",
+    "scipy>=1.10",
+    "pandas>=1.5",
+    "anndata>=0.9",
+    "scikit-learn>=1.2",
+    "statsmodels>=0.14",
+    "matplotlib>=3.6",
+    "seaborn>=0.12",
+    "igraph>=0.10",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "pytest-cov", "ruff"]
+
+[project.urls]
+Homepage = "https://github.com/omicverse/py-monocle2"
+Repository = "https://github.com/omicverse/py-monocle2"
+Issues = "https://github.com/omicverse/py-monocle2/issues"
+"Upstream (omicverse)" = "https://github.com/Starlitnightly/omicverse"
+
+[tool.setuptools.packages.find]
+include = ["monocle2_py*"]
+exclude = ["tests*", "examples*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::FutureWarning",
+    "ignore::RuntimeWarning",
+]

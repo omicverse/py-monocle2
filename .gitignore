@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+.ipynb_checkpoints/
+.vscode/
+.idea/
+*.swp
+.DS_Store
