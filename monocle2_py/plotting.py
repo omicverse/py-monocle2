@@ -1180,61 +1180,61 @@ def plot_complex_cell_trajectory(adata, color_by='State', show_branch_points=Tru
                                   root_states=None, figsize=(8, 6),
                                   cmap=None, ax=None, save=None, dpi=150):
     """
-    Plot the trajectory in tree-layout form (like Monocle2's
-    plot_complex_cell_trajectory). Uses a dendrogram-style layered layout
-    of the cell projection MST so branches are visually separated.
+    Dendrogram-style trajectory plot (like R Monocle2's
+    plot_complex_cell_trajectory): principal MST laid out with
+    Reingold–Tilford, each cell's x = its centroid's layout x (+ small
+    jitter), each cell's y = its real Pseudotime.
     """
-    import igraph as ig_
-
     monocle = adata.uns['monocle']
-    if 'pr_graph_cell_proj_tree' not in monocle:
-        raise ValueError("Run order_cells() first to build the cell projection MST")
+    if 'mst' not in monocle or 'pr_graph_cell_proj_closest_vertex' not in monocle:
+        raise ValueError("Run order_cells() first to build the principal MST")
 
-    cell_mst = monocle['pr_graph_cell_proj_tree']
-    vertex_names = cell_mst.vs['name']
-    N = len(vertex_names)
+    mst = monocle['mst']                                            # igraph, K centroids
+    closest = np.asarray(
+        monocle['pr_graph_cell_proj_closest_vertex']
+    ).ravel()                                                        # (N,)
+    pseudotime = adata.obs['Pseudotime'].values.astype(float)
 
-    pseudotime = adata.obs.loc[vertex_names, 'Pseudotime'].values
+    # Root = centroid with the smallest min-pseudotime among its cells
+    K = len(mst.vs)
+    min_pt = np.full(K, np.inf)
+    for v, pt in zip(closest, pseudotime):
+        if pt < min_pt[v]:
+            min_pt[v] = pt
+    finite = np.isfinite(min_pt)
+    root_vid = int(np.where(finite)[0][np.argmin(min_pt[finite])])
 
-    # Root = cell with min pseudotime
-    root_idx = int(np.argmin(pseudotime))
+    coords = np.array(mst.layout_reingold_tilford(root=[root_vid]).coords)  # (K, 2)
+    cent_x = coords[:, 0]
 
-    # BFS traversal from root; layer = pseudotime level
-    # x coordinate = horizontal spread based on branch
-    # y coordinate = pseudotime
-    # Use igraph layout_reingold_tilford for tree layout
-    tree_coords = cell_mst.layout_reingold_tilford(root=[root_idx])
-    coords = np.array(tree_coords.coords)  # (N, 2)
-
-    # Flip y so root is at top
-    coords[:, 1] = coords[:, 1].max() - coords[:, 1]
-
-    # Reorder to match adata.obs_names order
-    name_to_idx = {n: i for i, n in enumerate(vertex_names)}
-    order = [name_to_idx[n] for n in adata.obs_names]
-    coords_sorted = coords[order]
+    rng = np.random.default_rng(0)
+    dx = np.ptp(cent_x) if np.ptp(cent_x) > 0 else 1.0
+    jitter = 0.005 * dx                        # tight jitter; branches stay as thin columns
+    cell_x = cent_x[closest] + rng.normal(0, jitter, size=closest.size)
+    cell_y = pseudotime
 
     if ax is None:
         fig, ax = plt.subplots(1, 1, figsize=figsize)
     else:
         fig = ax.figure
 
-    # Draw edges
-    for e in cell_mst.es:
+    # Principal-graph skeleton: edges between centroids
+    for e in mst.es:
         i, j = e.source, e.target
-        ax.plot([coords[i, 0], coords[j, 0]],
-                [coords[i, 1], coords[j, 1]],
+        y_i = min_pt[i] if np.isfinite(min_pt[i]) else float(np.nanmedian(pseudotime))
+        y_j = min_pt[j] if np.isfinite(min_pt[j]) else float(np.nanmedian(pseudotime))
+        ax.plot([cent_x[i], cent_x[j]], [y_i, y_j],
                 color='black', linewidth=cell_link_size, zorder=1)
 
-    # Draw cells
+    # Cells
     if color_by in adata.obs.columns:
         vals = adata.obs[color_by].values
         if (hasattr(vals, 'categories')
             or not np.issubdtype(np.array(vals).dtype, np.floating)):
             cmap_colors = _get_state_colors(vals)
             colors = [cmap_colors[v] for v in vals]
-            ax.scatter(coords_sorted[:, 0], coords_sorted[:, 1],
-                       c=colors, s=cell_size ** 2 * 10, edgecolors='none', zorder=2)
+            ax.scatter(cell_x, cell_y, c=colors,
+                       s=cell_size ** 2 * 10, edgecolors='none', zorder=2)
             handles = [Line2D([0], [0], marker='o', color='w',
                               markerfacecolor=cmap_colors[s], markersize=6,
                               label=str(s))
@@ -1243,13 +1243,13 @@ def plot_complex_cell_trajectory(adata, color_by='State', show_branch_points=Tru
                       bbox_to_anchor=(0.5, 1.12),
                       ncol=min(len(handles), 6), frameon=False, fontsize=8)
         else:
-            sc = ax.scatter(coords_sorted[:, 0], coords_sorted[:, 1],
-                            c=vals.astype(float), s=cell_size ** 2 * 10,
+            sc = ax.scatter(cell_x, cell_y, c=vals.astype(float),
+                            s=cell_size ** 2 * 10,
                             cmap=cmap or 'viridis', zorder=2, edgecolors='none')
             plt.colorbar(sc, ax=ax, label=color_by)
     else:
-        ax.scatter(coords_sorted[:, 0], coords_sorted[:, 1],
-                   s=cell_size ** 2 * 10, edgecolors='none', zorder=2)
+        ax.scatter(cell_x, cell_y, s=cell_size ** 2 * 10,
+                   edgecolors='none', zorder=2)
 
     ax.set_xlabel('')
     ax.set_ylabel('Pseudotime')
