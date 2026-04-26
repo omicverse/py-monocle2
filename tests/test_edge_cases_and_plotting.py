@@ -11,6 +11,7 @@ from __future__ import annotations
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 import numpy as np
 import pandas as pd
 import pytest
@@ -123,6 +124,59 @@ def test_plot_cell_trajectory_pseudotime(ordered_mono):
 
 def test_plot_complex_cell_trajectory(ordered_mono):
     fig, ax = ordered_mono.plot_complex_cell_trajectory(color_by='State')
+    assert ax.get_xlabel() == ''
+    assert ax.get_ylabel() == 'Pseudotime'
+    plt.close(fig)
+
+
+def test_plot_trajectory_uses_obs_palette(ordered_mono):
+    ordered_mono.adata.uns['State_colors'] = ['#111111'] * ordered_mono.adata.obs['State'].nunique()
+    fig, ax = ordered_mono.plot_trajectory(color_by='State')
+    facecolors = ax.collections[0].get_facecolors()
+    assert len(facecolors) > 0
+    assert np.allclose(facecolors[0][:3], mcolors.to_rgb('#111111'))
+    plt.close(fig)
+
+
+def test_plot_trajectory_uses_right_margin_legend_by_default(ordered_mono):
+    fig, ax = ordered_mono.plot_trajectory(color_by='State')
+    legend = ax.get_legend()
+    assert legend is not None
+    assert legend._loc == 6
+    plt.close(fig)
+
+
+def test_plot_trajectory_respects_active_matplotlib_style(ordered_mono):
+    with plt.rc_context({
+        "axes.facecolor": "#eeeeee",
+        "axes.spines.top": True,
+        "axes.spines.right": True,
+    }):
+        fig, ax = ordered_mono.plot_trajectory(color_by='State')
+        assert np.allclose(ax.get_facecolor()[:3], mcolors.to_rgb('#eeeeee'))
+        assert ax.spines['top'].get_visible()
+        assert ax.spines['right'].get_visible()
+        plt.close(fig)
+
+
+def test_plot_complex_cell_trajectory_uses_obs_palette(ordered_mono):
+    ordered_mono.adata.uns['State_colors'] = ['#222222'] * ordered_mono.adata.obs['State'].nunique()
+    fig, ax = ordered_mono.plot_complex_cell_trajectory(color_by='State')
+    facecolors = ax.collections[0].get_facecolors()
+    assert len(facecolors) > 0
+    assert np.allclose(facecolors[0][:3], mcolors.to_rgb('#222222'))
+    assert ax.get_legend() is not None
+    plt.close(fig)
+
+
+def test_plot_trajectory_overlay_smoke(ordered_mono):
+    fig, ax = plt.subplots()
+    ax.scatter(
+        ordered_mono.adata.obsm['X_DDRTree'][:, 0],
+        ordered_mono.adata.obsm['X_DDRTree'][:, 1],
+        s=4,
+    )
+    ordered_mono.plot_trajectory_overlay(ax)
     plt.close(fig)
 
 
