@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
+import matplotlib.patheffects as pe
 from matplotlib.lines import Line2D
 from matplotlib.patches import Circle
 from scipy import sparse
@@ -26,10 +27,120 @@ def _monocle_theme(ax):
     ax.set_facecolor('white')
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
-    ax.spines['left'].set_linewidth(0.5)
-    ax.spines['bottom'].set_linewidth(0.5)
-    ax.tick_params(width=0.5, length=3)
+    ax.spines['left'].set_linewidth(0.8)
+    ax.spines['bottom'].set_linewidth(0.8)
+    ax.spines['left'].set_color('#5F6368')
+    ax.spines['bottom'].set_color('#5F6368')
+    ax.tick_params(width=0.8, length=3, colors='#5F6368', labelsize=9)
+    ax.title.set_fontsize(11)
+    ax.title.set_fontweight('semibold')
+    ax.xaxis.label.set_size(10)
+    ax.yaxis.label.set_size(10)
     ax.grid(False)
+    ax.set_axisbelow(True)
+
+
+def _is_categorical(values):
+    values = pd.Series(values)
+    return (
+        isinstance(values.dtype, pd.CategoricalDtype)
+        or pd.api.types.is_object_dtype(values)
+        or pd.api.types.is_string_dtype(values)
+        or pd.api.types.is_bool_dtype(values)
+    )
+
+
+def _get_obs_color_map(adata, color_key, values):
+    """Resolve categorical colors from ``adata.uns`` when available."""
+    series = pd.Series(values)
+    if isinstance(series.dtype, pd.CategoricalDtype):
+        categories = pd.Index(series.dtype.categories)
+    else:
+        categories = pd.Index(pd.unique(series))
+
+    uns_key = f'{color_key}_colors'
+    uns_colors = adata.uns.get(uns_key)
+    if uns_colors is not None and len(uns_colors) >= len(categories):
+        return {
+            cat: uns_colors[idx]
+            for idx, cat in enumerate(categories)
+        }
+    return _get_state_colors(categories)
+
+
+def _build_categorical_legend(ax, color_map, *, title=None, max_cols=6,
+                              anchor="right margin", loc=None,
+                              fontsize=8.5, markersize=6):
+    n_items = len(color_map)
+    ncols = min(max_cols, max(1, int(np.ceil(np.sqrt(n_items)))))
+    if anchor in {"right margin", "right"}:
+        loc = "center left" if loc is None else loc
+        bbox_to_anchor = (1.02, 0.5)
+        ncols = 1
+    else:
+        loc = "lower center" if loc is None else loc
+        bbox_to_anchor = anchor
+    handles = [
+        Line2D(
+            [0], [0],
+            marker='o', linestyle='',
+            markerfacecolor=color_map[state],
+            markeredgecolor='none',
+            markersize=markersize,
+            label=str(state),
+        )
+        for state in color_map.keys()
+    ]
+    legend = ax.legend(
+        handles=handles,
+        loc=loc,
+        bbox_to_anchor=bbox_to_anchor,
+        ncol=ncols,
+        frameon=False,
+        title=title,
+        columnspacing=1.0,
+        handletextpad=0.35,
+        borderaxespad=0.2,
+    )
+    if legend is not None and legend.get_title() is not None:
+        title_fontsize = (
+            fontsize + 0.5 if isinstance(fontsize, (int, float)) else fontsize
+        )
+        legend.get_title().set_fontsize(title_fontsize)
+    for text in legend.get_texts():
+        text.set_fontsize(fontsize)
+    return legend
+
+
+def _add_branch_point(ax, x, y, label, *, size=150, facecolor='black',
+                      edgecolor='white', text_color='white',
+                      fontsize=8, alpha=0.95, zorder=6):
+    ax.scatter(
+        x, y, s=size, c=facecolor, zorder=zorder,
+        edgecolors=edgecolor, linewidths=1.2, alpha=alpha,
+    )
+    ax.text(
+        x, y, str(label), ha='center', va='center',
+        color=text_color, fontsize=fontsize, fontweight='bold',
+        zorder=zorder + 1,
+        path_effects=[pe.withStroke(linewidth=1.5, foreground=facecolor)],
+    )
+
+
+def _style_colorbar(cbar, label):
+    cbar.set_label(label, fontsize=9)
+    cbar.ax.tick_params(labelsize=8, width=0.6, length=2)
+
+
+def _add_axis_padding(ax, coords_x, coords_y, frac=0.04):
+    if len(coords_x) == 0 or len(coords_y) == 0:
+        return
+    dx = np.nanmax(coords_x) - np.nanmin(coords_x)
+    dy = np.nanmax(coords_y) - np.nanmin(coords_y)
+    dx = dx if dx > 0 else 1.0
+    dy = dy if dy > 0 else 1.0
+    ax.set_xlim(np.nanmin(coords_x) - dx * frac, np.nanmax(coords_x) + dx * frac)
+    ax.set_ylim(np.nanmin(coords_y) - dy * frac, np.nanmax(coords_y) + dy * frac)
 
 
 def _resolve_gene_indices(adata, genes):
@@ -88,16 +199,94 @@ def _rotation_matrix(theta_degrees):
 
 
 # ============================================================================
+# plot_trajectory_overlay
+# ============================================================================
+
+def plot_trajectory_overlay(
+    adata,
+    ax,
+    *,
+    x: int = 0,
+    y: int = 1,
+    show_tree: bool = True,
+    show_branch_points: bool = True,
+    backbone_color: str = 'black',
+    cell_link_size: float = 0.75,
+    branch_point_size: float = 150,
+    branch_point_color: str = 'black',
+    branch_point_label_color: str = 'white',
+    branch_point_label_fontsize: float = 8,
+    theta: float = 0.0,
+    zorder_base: int = 3,
+):
+    """Overlay the learned DDRTree backbone on an existing axes."""
+    if 'monocle' not in adata.uns:
+        raise KeyError(
+            "adata.uns['monocle'] is missing — run "
+            "Monocle.reduce_dimension(method='DDRTree') first."
+        )
+    monocle = adata.uns['monocle']
+    if monocle.get('dim_reduce_type', 'DDRTree') != 'DDRTree':
+        raise ValueError(
+            f"plot_trajectory_overlay expects a DDRTree reduction, got "
+            f"{monocle.get('dim_reduce_type')!r}."
+        )
+    tree_coords = np.asarray(monocle['reducedDimK']).T
+    mst = monocle['mst']
+
+    if theta != 0:
+        rot = _rotation_matrix(theta)
+        tree_coords = np.column_stack([tree_coords[:, x], tree_coords[:, y]]) @ rot.T
+        x_plot, y_plot = 0, 1
+    else:
+        x_plot, y_plot = x, y
+
+    if show_tree:
+        for e in mst.es:
+            i, j = e.source, e.target
+            ax.plot(
+                [tree_coords[i, x_plot], tree_coords[j, x_plot]],
+                [tree_coords[i, y_plot], tree_coords[j, y_plot]],
+                color=backbone_color, linewidth=cell_link_size,
+                zorder=zorder_base,
+            )
+
+    if show_branch_points:
+        branch_points = monocle.get('branch_points', [])
+        mst_names = mst.vs['name']
+        for bp_idx, bp_name in enumerate(branch_points):
+            if bp_name not in mst_names:
+                continue
+            v_idx = mst_names.index(bp_name)
+            _add_branch_point(
+                ax,
+                tree_coords[v_idx, x_plot], tree_coords[v_idx, y_plot],
+                bp_idx + 1,
+                size=branch_point_size,
+                facecolor=branch_point_color,
+                text_color=branch_point_label_color,
+                fontsize=branch_point_label_fontsize,
+                zorder=zorder_base + 2,
+            )
+    return ax
+
+
+# ============================================================================
 # plot_cell_trajectory
 # ============================================================================
 
 def plot_cell_trajectory(adata, x=0, y=1, color_by='State',
                          show_tree=True, show_backbone=True,
-                         backbone_color='black',
+                         backbone_color='#2F3437',
                          markers=None, use_color_gradient=False,
                          show_cell_names=False, show_state_number=False,
-                         cell_size=1.5, cell_link_size=0.75,
+                         cell_size=2.0, cell_link_size=0.55,
                          show_branch_points=True, theta=0,
+                         legend_loc="right margin",
+                         legend_fontsize=8.5,
+                         branch_point_size=65,
+                         cell_alpha=0.88,
+                         tree_alpha=0.55,
                          figsize=(8, 6), ax=None, cmap=None,
                          save=None, dpi=150):
     """
@@ -198,26 +387,31 @@ def plot_cell_trajectory(adata, x=0, y=1, color_by='State',
                     ax_cur.plot(
                         [tree_coords[i, x_plot], tree_coords[j, x_plot]],
                         [tree_coords[i, y_plot], tree_coords[j, y_plot]],
-                        color='black', linewidth=cell_link_size, zorder=1
+                        color=backbone_color, linewidth=cell_link_size,
+                        alpha=tree_alpha, zorder=1
                     )
 
             if use_color_gradient:
                 sc = ax_cur.scatter(
                     cell_coords[:, x_plot], cell_coords[:, y_plot],
                     c=np.log10(expr + 0.1), s=cell_size ** 2,
-                    cmap=cmap or 'viridis', zorder=2
+                    cmap=cmap or 'viridis', zorder=2,
+                    edgecolors='none', alpha=cell_alpha
                 )
-                plt.colorbar(sc, ax=ax_cur, label='log10(expr + 0.1)')
+                cbar = plt.colorbar(sc, ax=ax_cur, pad=0.02)
+                _style_colorbar(cbar, 'log10(expr + 0.1)')
             else:
                 sc = ax_cur.scatter(
                     cell_coords[:, x_plot], cell_coords[:, y_plot],
                     c=np.log10(expr + 0.1), s=cell_size ** 2,
-                    cmap=cmap or 'viridis', zorder=2
+                    cmap=cmap or 'viridis', zorder=2,
+                    edgecolors='none', alpha=cell_alpha
                 )
 
             ax_cur.set_title(marker)
             ax_cur.set_xlabel(f'Component {x + 1}')
             ax_cur.set_ylabel(f'Component {y + 1}')
+            _add_axis_padding(ax_cur, cell_coords[:, x_plot], cell_coords[:, y_plot])
             _monocle_theme(ax_cur)
 
     else:
@@ -225,6 +419,7 @@ def plot_cell_trajectory(adata, x=0, y=1, color_by='State',
             fig, ax = plt.subplots(1, 1, figsize=figsize)
         else:
             fig = ax.figure
+        has_top_legend = False
 
         # Draw tree edges
         if show_tree:
@@ -233,38 +428,41 @@ def plot_cell_trajectory(adata, x=0, y=1, color_by='State',
                 ax.plot(
                     [tree_coords[i, x_plot], tree_coords[j, x_plot]],
                     [tree_coords[i, y_plot], tree_coords[j, y_plot]],
-                    color='black', linewidth=cell_link_size, zorder=1
+                    color=backbone_color, linewidth=cell_link_size,
+                    alpha=tree_alpha, zorder=1
                 )
 
         # Color by
         if color_by in adata.obs.columns:
             color_vals = adata.obs[color_by].values
-            if hasattr(color_vals, 'categories') or not np.issubdtype(
-                np.array(color_vals).dtype, np.floating
-            ):
+            if _is_categorical(color_vals):
                 # Categorical
-                color_map = _get_state_colors(color_vals)
+                color_map = _get_obs_color_map(adata, color_by, color_vals)
                 colors = [color_map[v] for v in color_vals]
-                ax.scatter(cell_coords[:, x_plot], cell_coords[:, y_plot],
-                           c=colors, s=cell_size ** 2, zorder=2, edgecolors='none')
-
-                # Legend
-                handles = [Line2D([0], [0], marker='o', color='w',
-                                  markerfacecolor=color_map[s], markersize=6,
-                                  label=str(s))
-                           for s in sorted(color_map.keys())]
-                ax.legend(handles=handles, loc='upper center',
-                          bbox_to_anchor=(0.5, 1.15), ncol=min(len(handles), 6),
-                          frameon=False)
+                ax.scatter(
+                    cell_coords[:, x_plot], cell_coords[:, y_plot],
+                    c=colors, s=cell_size ** 2, zorder=2, edgecolors='none',
+                    alpha=cell_alpha,
+                )
+                _build_categorical_legend(
+                    ax, color_map, title=color_by, anchor=legend_loc,
+                    fontsize=legend_fontsize,
+                )
+                has_top_legend = legend_loc not in {"right margin", "right"}
             else:
                 # Continuous
-                sc = ax.scatter(cell_coords[:, x_plot], cell_coords[:, y_plot],
-                                c=color_vals.astype(float), s=cell_size ** 2,
-                                cmap=cmap or 'Blues', zorder=2, edgecolors='none')
-                plt.colorbar(sc, ax=ax, label=color_by)
+                sc = ax.scatter(
+                    cell_coords[:, x_plot], cell_coords[:, y_plot],
+                    c=color_vals.astype(float), s=cell_size ** 2,
+                    cmap=cmap or 'Blues', zorder=2, edgecolors='none',
+                    alpha=cell_alpha,
+                )
+                cbar = plt.colorbar(sc, ax=ax, pad=0.02)
+                _style_colorbar(cbar, color_by)
         else:
             ax.scatter(cell_coords[:, x_plot], cell_coords[:, y_plot],
-                       s=cell_size ** 2, zorder=2, edgecolors='none')
+                       s=cell_size ** 2, zorder=2, edgecolors='none',
+                       alpha=cell_alpha, color='#4C72B0')
 
         # Branch points
         if show_branch_points and dim_type == 'DDRTree':
@@ -273,17 +471,27 @@ def plot_cell_trajectory(adata, x=0, y=1, color_by='State',
             for bp_idx, bp_name in enumerate(branch_points):
                 if bp_name in mst_names:
                     v_idx = mst_names.index(bp_name)
-                    ax.scatter(tree_coords[v_idx, x_plot], tree_coords[v_idx, y_plot],
-                               s=150, c='black', zorder=5, edgecolors='white', linewidths=1.5)
-                    ax.text(tree_coords[v_idx, x_plot], tree_coords[v_idx, y_plot],
-                            str(bp_idx + 1), ha='center', va='center',
-                            color='white', fontsize=8, fontweight='bold', zorder=6)
+                    _add_branch_point(
+                        ax,
+                        tree_coords[v_idx, x_plot], tree_coords[v_idx, y_plot],
+                        bp_idx + 1,
+                        size=branch_point_size,
+                        facecolor=backbone_color,
+                        alpha=0.92,
+                    )
 
         ax.set_xlabel(f'Component {x + 1}')
         ax.set_ylabel(f'Component {y + 1}')
+        _add_axis_padding(ax, cell_coords[:, x_plot], cell_coords[:, y_plot])
         _monocle_theme(ax)
 
-    fig.tight_layout()
+    if markers is not None and len(markers) > 0:
+        fig.tight_layout()
+    else:
+        if legend_loc in {"right margin", "right"}:
+            fig.tight_layout(rect=(0, 0, 0.86, 1))
+        else:
+            fig.tight_layout(rect=(0, 0, 1, 0.84 if has_top_legend else 1))
 
     if save:
         fig.savefig(save, dpi=dpi, bbox_inches='tight')
@@ -299,6 +507,7 @@ def plot_genes_in_pseudotime(adata, genes, min_expr=None,
                               cell_size=0.75, ncol=1, nrow=None,
                               color_by='State', trend_formula="~sm.ns(Pseudotime, df=3)",
                               label_by_short_name=True, relative_expr=True,
+                              trend_color='black',
                               figsize=None, save=None, dpi=150):
     """
     Plot gene expression vs pseudotime with smoothed curves.
@@ -347,10 +556,16 @@ def plot_genes_in_pseudotime(adata, genes, min_expr=None,
     # Color mapping
     if color_by in adata.obs.columns:
         color_vals = adata.obs[color_by].values
-        color_map = _get_state_colors(color_vals)
-        colors = [color_map[v] for v in color_vals]
+        if _is_categorical(color_vals):
+            color_map = _get_obs_color_map(adata, color_by, color_vals)
+            colors = [color_map[v] for v in color_vals]
+            continuous_color = False
+        else:
+            colors = np.asarray(color_vals, dtype=float)
+            continuous_color = True
     else:
         colors = ['steelblue'] * adata.n_obs
+        continuous_color = False
 
     # Generate smooth curves
     new_data = pd.DataFrame({
@@ -388,16 +603,35 @@ def plot_genes_in_pseudotime(adata, genes, min_expr=None,
             expr = np.maximum(expr, min_expr)
 
         # Scatter plot
-        ax.scatter(pseudotime, expr, c=colors, s=cell_size ** 2,
-                   alpha=0.6, edgecolors='none', zorder=2)
+        scatter_kwargs = {
+            's': cell_size ** 2,
+            'alpha': 0.55,
+            'edgecolors': 'none',
+            'zorder': 2,
+        }
+        if continuous_color:
+            sc = ax.scatter(
+                pseudotime, expr, c=colors,
+                cmap='viridis', **scatter_kwargs
+            )
+        else:
+            sc = ax.scatter(
+                pseudotime, expr, c=colors,
+                **scatter_kwargs
+            )
 
         # Smooth curve
         curve = smooth_curves[gene_idx, :]
         if not np.all(np.isnan(curve)):
             if min_expr is not None:
                 curve = np.maximum(curve, min_expr)
-            ax.plot(pseudotime[sort_idx], curve[sort_idx],
-                    color='black', linewidth=1.5, zorder=3)
+            line = ax.plot(
+                pseudotime[sort_idx], curve[sort_idx],
+                color=trend_color, linewidth=1.8, zorder=3,
+            )[0]
+            line.set_path_effects(
+                [pe.withStroke(linewidth=3.2, foreground='white', alpha=0.9)]
+            )
 
         # Use short name if available
         if label_by_short_name and 'gene_short_name' in adata.var.columns:
@@ -418,6 +652,7 @@ def plot_genes_in_pseudotime(adata, genes, min_expr=None,
             ax.set_yscale('log')
 
         _monocle_theme(ax)
+        ax.margins(x=0.03)
 
     # Remove empty axes
     for idx in range(n_genes, nrow * ncol):
@@ -426,15 +661,22 @@ def plot_genes_in_pseudotime(adata, genes, min_expr=None,
         axes[row, col].set_visible(False)
 
     # Legend
-    if color_by in adata.obs.columns:
-        color_vals_unique = sorted(set(adata.obs[color_by].values))
-        handles = [Line2D([0], [0], marker='o', color='w',
-                          markerfacecolor=_get_state_colors(adata.obs[color_by].values)[s],
-                          markersize=6, label=str(s))
-                   for s in color_vals_unique]
-        fig.legend(handles=handles, loc='upper center',
-                   bbox_to_anchor=(0.5, 1.02), ncol=min(len(handles), 6),
-                   frameon=False)
+    if color_by in adata.obs.columns and not continuous_color:
+        color_map = _get_obs_color_map(adata, color_by, adata.obs[color_by].values)
+        handles = [
+            Line2D([0], [0], marker='o', linestyle='',
+                   markerfacecolor=color_map[s], markeredgecolor='none',
+                   markersize=6, label=str(s))
+            for s in color_map.keys()
+        ]
+        fig.legend(
+            handles=handles, loc='upper center',
+            bbox_to_anchor=(0.5, 1.02), ncol=min(len(handles), 6),
+            frameon=False, title=color_by,
+        )
+    elif color_by in adata.obs.columns and continuous_color:
+        cbar = fig.colorbar(sc, ax=axes.ravel().tolist(), shrink=0.92, pad=0.02)
+        _style_colorbar(cbar, color_by)
 
     fig.tight_layout()
 
@@ -607,6 +849,8 @@ def plot_genes_branched_heatmap(adata, branch_point=1, branch_states=None,
     ax_col.set_xticks([])
     ax_col.set_yticks([])
     ax_col.axvline(x=n_points - 0.5, color='white', linewidth=2)
+    for spine in ax_col.spines.values():
+        spine.set_visible(False)
 
     # Row cluster annotation
     ax_row = fig.add_subplot(gs[1, 0])
@@ -618,6 +862,8 @@ def plot_genes_branched_heatmap(adata, branch_point=1, branch_states=None,
     ax_row.imshow(row_bar, aspect='auto')
     ax_row.set_xticks([])
     ax_row.set_yticks([])
+    for spine in ax_row.spines.values():
+        spine.set_visible(False)
 
     # Main heatmap
     ax_heat = fig.add_subplot(gs[1, 1])
@@ -648,6 +894,18 @@ def plot_genes_branched_heatmap(adata, branch_point=1, branch_states=None,
     ax_heat.set_xlabel('')
     ax_col.set_title(f'{branch_labels[0]}  ←  Pre-branch  →  {branch_labels[1]}',
                       fontsize=10)
+    _monocle_theme(ax_heat)
+    ax_heat.spines['left'].set_visible(False)
+    ax_heat.spines['bottom'].set_visible(False)
+
+    cbar = fig.colorbar(
+        plt.cm.ScalarMappable(
+            norm=plt.Normalize(vmin=scale_min, vmax=scale_max),
+            cmap=hmcols,
+        ),
+        ax=ax_heat, fraction=0.025, pad=0.02,
+    )
+    _style_colorbar(cbar, 'Scaled expression')
 
     if save:
         fig.savefig(save, dpi=dpi, bbox_inches='tight')
@@ -1014,27 +1272,57 @@ def plot_ordering_genes(adata, figsize=(6, 4), save=None, dpi=150):
                                      pd.Series(False, index=adata.var_names))
 
     valid = (mu > 0) & np.isfinite(disp) & (disp > 0)
+    x_other = np.log10(mu[valid & ~use_for_ordering])
+    y_other = np.log10(disp[valid & ~use_for_ordering])
 
-    ax.scatter(np.log10(mu[valid & ~use_for_ordering]),
-               np.log10(disp[valid & ~use_for_ordering]),
-               c='grey', s=2, alpha=0.3, label='Other genes')
+    ax.scatter(
+        x_other, y_other,
+        c='#9AA0A6', s=7, alpha=0.35, label='Other genes',
+        edgecolors='none', rasterized=len(x_other) > 2000,
+    )
 
     if use_for_ordering.sum() > 0:
-        ax.scatter(np.log10(mu[valid & use_for_ordering]),
-                   np.log10(disp[valid & use_for_ordering]),
-                   c='red', s=4, alpha=0.6, label='Ordering genes')
+        x_order = np.log10(mu[valid & use_for_ordering])
+        y_order = np.log10(disp[valid & use_for_ordering])
+        ax.scatter(
+            x_order, y_order,
+            c='#E64B35', s=12, alpha=0.78,
+            label=f'Ordering genes (n={int((valid & use_for_ordering).sum())})',
+            edgecolors='none', rasterized=len(x_order) > 2000,
+        )
+    else:
+        x_order = np.array([])
+        y_order = np.array([])
 
     # Fitted curve
     if 'dispersion_fit' in adata.var.columns:
         fitted = adata.var['dispersion_fit']
-        sort_idx = np.argsort(mu[valid].values)
-        ax.plot(np.log10(mu[valid].values[sort_idx]),
-                np.log10(fitted[valid].values[sort_idx]),
-                color='blue', linewidth=1, label='Fitted')
+        valid_fit = valid & np.isfinite(fitted) & (fitted > 0)
+        if valid_fit.any():
+            sort_idx = np.argsort(mu[valid_fit].values)
+            line = ax.plot(
+                np.log10(mu[valid_fit].values[sort_idx]),
+                np.log10(fitted[valid_fit].values[sort_idx]),
+                color='#3C5488', linewidth=2.0, label='Fitted dispersion',
+                zorder=3,
+            )[0]
+            line.set_path_effects(
+                [pe.withStroke(linewidth=3.4, foreground='white', alpha=0.85)]
+            )
 
     ax.set_xlabel('log10(Mean Expression)')
     ax.set_ylabel('log10(Dispersion)')
-    ax.legend(frameon=False)
+    ax.set_title('Ordering Gene Selection')
+    ax.legend(
+        frameon=False, loc='lower left',
+        handlelength=1.2, handletextpad=0.4, borderpad=0.2,
+    )
+    _add_axis_padding(
+        ax,
+        np.concatenate([x_other, x_order]) if len(x_order) > 0 else x_other,
+        np.concatenate([y_other, y_order]) if len(y_order) > 0 else y_other,
+        frac=0.03,
+    )
     _monocle_theme(ax)
     fig.tight_layout()
 
@@ -1176,9 +1464,11 @@ def plot_pseudotime_heatmap(adata, genes=None, num_clusters=6,
 # ============================================================================
 
 def plot_complex_cell_trajectory(adata, color_by='State', show_branch_points=True,
-                                  cell_size=0.5, cell_link_size=0.3,
+                                  cell_size=0.8, cell_link_size=0.22,
                                   root_states=None, figsize=(8, 6),
-                                  cmap=None, ax=None, save=None, dpi=150):
+                                  cmap=None, ax=None, legend_loc="right margin",
+                                  legend_fontsize=8.5, cell_alpha=0.86,
+                                  jitter_width=0.006, save=None, dpi=150):
     """
     Plot the trajectory in tree-layout form (like Monocle2's
     plot_complex_cell_trajectory). Uses a dendrogram-style layered layout
@@ -1206,13 +1496,19 @@ def plot_complex_cell_trajectory(adata, color_by='State', show_branch_points=Tru
     tree_coords = cell_mst.layout_reingold_tilford(root=[root_idx])
     coords = np.array(tree_coords.coords)  # (N, 2)
 
-    # Flip y so root is at top
+    # Keep the original Monocle2-style tree layout: branches are separated
+    # horizontally while progression runs vertically from the root.
     coords[:, 1] = coords[:, 1].max() - coords[:, 1]
 
     # Reorder to match adata.obs_names order
     name_to_idx = {n: i for i, n in enumerate(vertex_names)}
     order = [name_to_idx[n] for n in adata.obs_names]
     coords_sorted = coords[order]
+    dx = np.nanmax(coords[:, 0]) - np.nanmin(coords[:, 0])
+    dx = dx if dx > 0 else 1.0
+    rng = np.random.default_rng(0)
+    coords_scatter = coords_sorted.copy()
+    coords_scatter[:, 0] += rng.normal(0.0, dx * jitter_width, size=coords_scatter.shape[0])
 
     if ax is None:
         fig, ax = plt.subplots(1, 1, figsize=figsize)
@@ -1224,38 +1520,44 @@ def plot_complex_cell_trajectory(adata, color_by='State', show_branch_points=Tru
         i, j = e.source, e.target
         ax.plot([coords[i, 0], coords[j, 0]],
                 [coords[i, 1], coords[j, 1]],
-                color='black', linewidth=cell_link_size, zorder=1)
+                color='#3A3A3A', linewidth=cell_link_size, alpha=0.38, zorder=1)
 
     # Draw cells
     if color_by in adata.obs.columns:
         vals = adata.obs[color_by].values
-        if (hasattr(vals, 'categories')
-            or not np.issubdtype(np.array(vals).dtype, np.floating)):
-            cmap_colors = _get_state_colors(vals)
+        if _is_categorical(vals):
+            cmap_colors = _get_obs_color_map(adata, color_by, vals)
             colors = [cmap_colors[v] for v in vals]
-            ax.scatter(coords_sorted[:, 0], coords_sorted[:, 1],
-                       c=colors, s=cell_size ** 2 * 10, edgecolors='none', zorder=2)
-            handles = [Line2D([0], [0], marker='o', color='w',
-                              markerfacecolor=cmap_colors[s], markersize=6,
-                              label=str(s))
-                       for s in sorted(cmap_colors.keys())]
-            ax.legend(handles=handles, loc='upper center',
-                      bbox_to_anchor=(0.5, 1.12),
-                      ncol=min(len(handles), 6), frameon=False, fontsize=8)
+            ax.scatter(
+                coords_scatter[:, 0], coords_scatter[:, 1],
+                c=colors, s=cell_size ** 2 * 10,
+                edgecolors='none', alpha=cell_alpha, zorder=2,
+            )
+            _build_categorical_legend(
+                ax,
+                cmap_colors,
+                title=color_by,
+                anchor=legend_loc,
+                fontsize=legend_fontsize,
+            )
         else:
-            sc = ax.scatter(coords_sorted[:, 0], coords_sorted[:, 1],
+            sc = ax.scatter(coords_scatter[:, 0], coords_scatter[:, 1],
                             c=vals.astype(float), s=cell_size ** 2 * 10,
-                            cmap=cmap or 'viridis', zorder=2, edgecolors='none')
+                            cmap=cmap or 'viridis', zorder=2, edgecolors='none',
+                            alpha=cell_alpha)
             plt.colorbar(sc, ax=ax, label=color_by)
     else:
-        ax.scatter(coords_sorted[:, 0], coords_sorted[:, 1],
-                   s=cell_size ** 2 * 10, edgecolors='none', zorder=2)
+        ax.scatter(
+            coords_scatter[:, 0], coords_scatter[:, 1],
+            s=cell_size ** 2 * 10, edgecolors='none',
+            alpha=cell_alpha, zorder=2,
+        )
 
     ax.set_xlabel('')
     ax.set_ylabel('Pseudotime')
     ax.set_xticks([])
     _monocle_theme(ax)
-    fig.tight_layout()
+    fig.tight_layout(rect=(0, 0, 0.86, 1) if legend_loc in {"right margin", "right"} else None)
 
     if save:
         fig.savefig(save, dpi=dpi, bbox_inches='tight')

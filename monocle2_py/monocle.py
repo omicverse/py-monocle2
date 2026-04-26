@@ -640,6 +640,10 @@ class Monocle:
     # Alias matching Monocle2 R names
     plot_cell_trajectory = plot_trajectory
 
+    def plot_trajectory_overlay(self, ax, **kwargs):
+        """Overlay only the DDRTree backbone + branch points on an axes."""
+        return self._m2.plot_trajectory_overlay(self.adata, ax, **kwargs)
+
     def plot_complex_cell_trajectory(self, color_by: str = 'State', **kwargs):
         """Dendrogram-style trajectory layout (Pseudotime on Y-axis)."""
         return self._m2.plot_complex_cell_trajectory(self.adata, color_by=color_by, **kwargs)
