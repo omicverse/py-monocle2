@@ -146,6 +146,19 @@ def test_plot_trajectory_uses_right_margin_legend_by_default(ordered_mono):
     plt.close(fig)
 
 
+def test_plot_trajectory_respects_active_matplotlib_style(ordered_mono):
+    with plt.rc_context({
+        "axes.facecolor": "#eeeeee",
+        "axes.spines.top": True,
+        "axes.spines.right": True,
+    }):
+        fig, ax = ordered_mono.plot_trajectory(color_by='State')
+        assert np.allclose(ax.get_facecolor()[:3], mcolors.to_rgb('#eeeeee'))
+        assert ax.spines['top'].get_visible()
+        assert ax.spines['right'].get_visible()
+        plt.close(fig)
+
+
 def test_plot_complex_cell_trajectory_uses_obs_palette(ordered_mono):
     ordered_mono.adata.uns['State_colors'] = ['#222222'] * ordered_mono.adata.obs['State'].nunique()
     fig, ax = ordered_mono.plot_complex_cell_trajectory(color_by='State')

@@ -2,7 +2,7 @@
 Visualization functions for monocle2_py.
 
 Faithfully reproduces Monocle2's ggplot2-based plots using matplotlib.
-Matches Monocle2's visual style: white background, top legend, clean theme.
+Axes styling follows the active matplotlib style.
 """
 
 import colorsys
@@ -23,21 +23,8 @@ from scipy import sparse
 # ============================================================================
 
 def _monocle_theme(ax):
-    """Apply Monocle2 theme to matplotlib axes."""
-    ax.set_facecolor('white')
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-    ax.spines['left'].set_linewidth(0.8)
-    ax.spines['bottom'].set_linewidth(0.8)
-    ax.spines['left'].set_color('#5F6368')
-    ax.spines['bottom'].set_color('#5F6368')
-    ax.tick_params(width=0.8, length=3, colors='#5F6368', labelsize=9)
-    ax.title.set_fontsize(11)
-    ax.title.set_fontweight('semibold')
-    ax.xaxis.label.set_size(10)
-    ax.yaxis.label.set_size(10)
-    ax.grid(False)
-    ax.set_axisbelow(True)
+    """Leave axes styling to the active matplotlib style."""
+    return ax
 
 
 def _is_categorical(values):
@@ -70,7 +57,7 @@ def _get_obs_color_map(adata, color_key, values):
 
 def _build_categorical_legend(ax, color_map, *, title=None, max_cols=6,
                               anchor="right margin", loc=None,
-                              fontsize=8.5, markersize=6):
+                              fontsize=None, markersize=6):
     n_items = len(color_map)
     ncols = min(max_cols, max(1, int(np.ceil(np.sqrt(n_items)))))
     if anchor in {"right margin", "right"}:
@@ -102,13 +89,14 @@ def _build_categorical_legend(ax, color_map, *, title=None, max_cols=6,
         handletextpad=0.35,
         borderaxespad=0.2,
     )
-    if legend is not None and legend.get_title() is not None:
-        title_fontsize = (
-            fontsize + 0.5 if isinstance(fontsize, (int, float)) else fontsize
-        )
-        legend.get_title().set_fontsize(title_fontsize)
-    for text in legend.get_texts():
-        text.set_fontsize(fontsize)
+    if fontsize is not None:
+        if legend is not None and legend.get_title() is not None:
+            title_fontsize = (
+                fontsize + 0.5 if isinstance(fontsize, (int, float)) else fontsize
+            )
+            legend.get_title().set_fontsize(title_fontsize)
+        for text in legend.get_texts():
+            text.set_fontsize(fontsize)
     return legend
 
 
@@ -128,8 +116,7 @@ def _add_branch_point(ax, x, y, label, *, size=150, facecolor='black',
 
 
 def _style_colorbar(cbar, label):
-    cbar.set_label(label, fontsize=9)
-    cbar.ax.tick_params(labelsize=8, width=0.6, length=2)
+    cbar.set_label(label)
 
 
 def _add_axis_padding(ax, coords_x, coords_y, frac=0.04):
@@ -283,7 +270,7 @@ def plot_cell_trajectory(adata, x=0, y=1, color_by='State',
                          cell_size=2.0, cell_link_size=0.55,
                          show_branch_points=True, theta=0,
                          legend_loc="right margin",
-                         legend_fontsize=8.5,
+                         legend_fontsize=None,
                          branch_point_size=65,
                          cell_alpha=0.88,
                          tree_alpha=0.55,
@@ -1467,7 +1454,7 @@ def plot_complex_cell_trajectory(adata, color_by='State', show_branch_points=Tru
                                   cell_size=0.8, cell_link_size=0.22,
                                   root_states=None, figsize=(8, 6),
                                   cmap=None, ax=None, legend_loc="right margin",
-                                  legend_fontsize=8.5, cell_alpha=0.86,
+                                  legend_fontsize=None, cell_alpha=0.86,
                                   jitter_width=0.006, save=None, dpi=150):
     """
     Plot the trajectory in tree-layout form (like Monocle2's
