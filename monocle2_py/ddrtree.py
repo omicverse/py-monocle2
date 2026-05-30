@@ -422,10 +422,105 @@ def _get_major_eigenvalue(C, L, compat=True):
         return float(min(s, 1.0)) if compat else float(s)
 
 
+def _build_center_mst_nn(Y, N):
+    """Final weighted MST on the K centers, embedded in an (N, N) sparse matrix.
+
+    Mirrors ``DDRTree.cpp:528-539``: the returned ``stree`` is
+    ``(N_cells, N_cells)`` but only the top-left ``(K, K)`` center block is
+    populated. The matrix is symmetric; entries are the squared Euclidean
+    distances between MST-linked centers (``_sqdist(Y, Y)``).
+
+    Shared by the pure-Python path and the ``fastddrtree`` backend so both
+    return a byte-for-byte identical ``stree`` construction for the same ``Y``.
+    """
+    distsqMU = _sqdist(Y, Y)
+    dist_dense = distsqMU.copy()
+    np.fill_diagonal(dist_dense, 0)
+    mst_KK = minimum_spanning_tree(csr_matrix(dist_dense))  # (K, K)
+    mst_KK_sym = mst_KK + mst_KK.T
+    mst_KK_coo = mst_KK_sym.tocoo()
+    return _sparse.coo_matrix(
+        (mst_KK_coo.data, (mst_KK_coo.row, mst_KK_coo.col)),
+        shape=(N, N),
+    ).tocsr()
+
+
+def _ddrtree_fastddrtree(X, *, dimensions, maxIter, sigma, lambda_param,
+                         ncenter, param_gamma, tol, verbose, random_state,
+                         method='fast', pca_method='irlba', initial_method=None):
+    """Dispatch DDRTree to the optional Rust ``fastddrtree`` backend.
+
+    The Rust core is R-parity (HSMM seed=42 procrustes ≈ 4e-14 vs R Monocle 2
+    on a C-contiguous input), so its output matches the ``'exact'`` Python path.
+    ``method`` and ``pca_method`` select Python-only optimisation strategies and
+    are therefore ignored here; a custom ``initial_method`` cannot be honoured
+    (the Rust core always initialises ``W`` via PCA) and raises.
+
+    Returns the same 5-key dict contract as the pure-Python ``DDRTree``.
+    """
+    # Validate unsupported config before attempting the optional import, so the
+    # error is actionable regardless of whether fastddrtree is installed.
+    if initial_method is not None:
+        raise ValueError(
+            "backend='fastddrtree' does not support a custom initial_method; "
+            "the Rust core always initialises W via PCA. Use backend='python' "
+            "for custom initialisation."
+        )
+
+    try:
+        import fastddrtree
+    except ImportError as exc:
+        raise ImportError(
+            "backend='fastddrtree' requires the optional 'fastddrtree' package "
+            "(Rust DDRTree core via pyo3). Install a prebuilt wheel with "
+            "`pip install fastddrtree`, or build it locally with "
+            "`maturin develop --release` from crates/ddrtree-py."
+        ) from exc
+
+    # The pyo3 binding reads X through a zero-copy C-contiguous slice and
+    # rejects non-C-contiguous (e.g. Fortran-order) input — silently mis-reading
+    # a Fortran-order buffer as C-order scrambles the matrix. Guarantee layout.
+    X = np.ascontiguousarray(X, dtype=np.float64)
+
+    # Match the pure-Python DDRTree contract exactly:
+    #   * ncenter=None means K=N (every cell is a center). The Rust core would
+    #     otherwise auto-select K=cal_ncenter(N) for N>=100 (ddrtree-core
+    #     init.rs), so pass N explicitly to keep backend='fastddrtree' a
+    #     transparent swap for backend='python'.
+    #   * random_state=None is allowed by reduce_dimension's documented API;
+    #     map it to the shared default seed (2016) instead of crashing on
+    #     int(None). The Python path is deterministic and ignores the seed.
+    ncenter_eff = X.shape[1] if ncenter is None else ncenter
+    seed_eff = 2016 if random_state is None else int(random_state)
+
+    result = fastddrtree.fit(
+        X,
+        dimensions=dimensions,
+        max_iter=maxIter,
+        sigma=sigma,
+        ncenter=ncenter_eff,
+        lambda_param=lambda_param,
+        param_gamma=float(param_gamma),
+        tol=tol,
+        verbose=verbose,
+        random_seed=seed_eff,
+    )
+
+    Y = np.ascontiguousarray(result['Y'])
+    stree = _build_center_mst_nn(Y, X.shape[1])
+    return {
+        'W': result['W'],
+        'Z': result['Z'],
+        'Y': Y,
+        'stree': stree,
+        'objective_vals': list(result['objective_vals']),
+    }
+
+
 def DDRTree(X, dimensions=2, initial_method=None, maxIter=20, sigma=0.001,
             lambda_param=None, ncenter=None, param_gamma=10, tol=0.001,
             verbose=False, pca_method='irlba', random_state=2016,
-            method='fast'):
+            method='fast', backend='python'):
     """
     Perform DDRTree dimensionality reduction.
 
@@ -446,6 +541,13 @@ def DDRTree(X, dimensions=2, initial_method=None, maxIter=20, sigma=0.001,
         evaluating the full objective (including ``||X - WZ||_2^2``)
         on every iteration.  Use this when bitwise agreement with R
         is required.
+    backend : {'python', 'fastddrtree'}, default 'python'
+        ``'python'`` runs the pure-Python implementation in this module.
+        ``'fastddrtree'`` dispatches to the optional Rust core (pyo3 binding,
+        ``pip install fastddrtree``), which is R-parity and typically faster.
+        With ``'fastddrtree'`` the ``method``/``pca_method`` options are ignored
+        (the Rust core uses its own R-faithful update path) and a custom
+        ``initial_method`` raises ``ValueError``.
     X : np.ndarray, shape (D, N)
         Input data matrix (genes x cells), already preprocessed.
     dimensions : int
@@ -493,6 +595,18 @@ def DDRTree(X, dimensions=2, initial_method=None, maxIter=20, sigma=0.001,
             "finite float64 matrix."
         )
     D, N = X.shape
+
+    if backend == 'fastddrtree':
+        return _ddrtree_fastddrtree(
+            X, dimensions=dimensions, maxIter=maxIter, sigma=sigma,
+            lambda_param=lambda_param, ncenter=ncenter, param_gamma=param_gamma,
+            tol=tol, verbose=verbose, random_state=random_state,
+            method=method, pca_method=pca_method, initial_method=initial_method,
+        )
+    if backend != 'python':
+        raise ValueError(
+            f"backend must be 'python' or 'fastddrtree', got {backend!r}"
+        )
 
     # PCA initialization for W — cache XXT so the fast-mode inner loop
     # can reuse it instead of recomputing ``Q @ X.T`` (D²·N) every
@@ -806,17 +920,7 @@ def DDRTree(X, dimensions=2, initial_method=None, maxIter=20, sigma=0.001,
     # center-pair positions. Downstream Monocle 2 consumers (e.g. the
     # ``project2MST`` helper) index ``stree`` with cell indices and expect
     # the larger shape.
-    distsqMU = _sqdist(Y, Y)
-    dist_dense = distsqMU.copy()
-    np.fill_diagonal(dist_dense, 0)
-    mst_KK = minimum_spanning_tree(csr_matrix(dist_dense))  # (K, K)
-    mst_KK_sym = mst_KK + mst_KK.T
-    # Embed the (K, K) MST into the top-left block of an (N, N) matrix.
-    mst_KK_coo = mst_KK_sym.tocoo()
-    stree = _sparse.coo_matrix(
-        (mst_KK_coo.data, (mst_KK_coo.row, mst_KK_coo.col)),
-        shape=(N, N),
-    ).tocsr()
+    stree = _build_center_mst_nn(Y, N)
 
     return {
         'W': W,
