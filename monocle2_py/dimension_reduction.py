@@ -182,7 +182,7 @@ def reduce_dimension(adata, max_components=2, reduction_method='DDRTree',
 
         ddr_kwargs = {'random_state': random_state}
         for key in ['initial_method', 'maxIter', 'sigma', 'lambda_param',
-                    'param_gamma', 'tol', 'pca_method', 'method']:
+                    'param_gamma', 'tol', 'pca_method', 'method', 'backend']:
             if key in kwargs:
                 ddr_kwargs[key] = kwargs[key]
 
@@ -191,7 +191,8 @@ def reduce_dimension(adata, max_components=2, reduction_method='DDRTree',
         # bitwise agreement with R Monocle 2 can opt into exact mode.
         global _FAST_HINT_SHOWN
         _ddr_method = ddr_kwargs.get('method', 'fast')
-        if _ddr_method == 'fast' and not _FAST_HINT_SHOWN:
+        _ddr_backend = ddr_kwargs.get('backend', 'python')
+        if _ddr_backend == 'python' and _ddr_method == 'fast' and not _FAST_HINT_SHOWN:
             print("[monocle2_py] Using fast DDRTree (≈3× speed-up, pseudotime "
                   "correlation with R ≥ 0.99). Pass method='exact' for bitwise "
                   "R Monocle 2 parity.")

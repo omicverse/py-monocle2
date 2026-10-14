@@ -12,7 +12,19 @@ from scipy.sparse.linalg import eigsh
 from scipy.spatial.distance import cdist
 from scipy.sparse.csgraph import minimum_spanning_tree
 from scipy.linalg import cho_factor, cho_solve
-from sklearn.cluster import KMeans
+
+# Optional numba acceleration for Hartigan-Wong inner loops. The patch must
+# work without numba; if it is not installed the @njit decorator becomes a
+# no-op and the same NumPy code runs unaccelerated (slower but identical).
+try:
+    from numba import njit  # type: ignore
+except ImportError:  # pragma: no cover
+    def njit(*args, **kwargs):  # noqa: D401
+        if len(args) == 1 and callable(args[0]):
+            return args[0]
+        def _wrap(f):
+            return f
+        return _wrap
 
 
 def _sqdist(a, b):
@@ -38,18 +50,21 @@ def _pca_projection_irlba_like(C, L):
     D = C.shape[0]
     if L >= min(C.shape):
         eigenvalues, eigenvectors = np.linalg.eigh(C)
-        idx = np.argsort(eigenvalues)[::-1]
+        # Sort by |eigenvalue| descending. Algebraic-sort + which='LM' below
+        # mismatch if sym_mat becomes indefinite (issue #14). Defensive only —
+        # HSMM has sym_mat PSD on every iter (verified Subagent C).
+        idx = np.argsort(np.abs(eigenvalues))[::-1]
         return eigenvectors[:, idx[:L]]
     v0 = _norm.ppf(np.arange(1, D + 1) / (D + 1))
     v0 = v0 / np.linalg.norm(v0)
     try:
         eigenvalues, eigenvectors = eigsh(C, k=L, which='LM', v0=v0,
                                           maxiter=1000, tol=1e-5)
-        idx = np.argsort(eigenvalues)[::-1]
+        idx = np.argsort(np.abs(eigenvalues))[::-1]
         return eigenvectors[:, idx]
     except Exception:
         eigenvalues, eigenvectors = np.linalg.eigh(C)
-        idx = np.argsort(eigenvalues)[::-1]
+        idx = np.argsort(np.abs(eigenvalues))[::-1]
         return eigenvectors[:, idx[:L]]
 
 
@@ -70,7 +85,7 @@ def _pca_projection(C, L):
     # Memory: D*D*8 bytes, 4000x4000 = 128MB is fine
     if L >= min(C.shape) or D <= 5000:
         eigenvalues, eigenvectors = np.linalg.eigh(C)
-        idx = np.argsort(eigenvalues)[::-1]
+        idx = np.argsort(np.abs(eigenvalues))[::-1]
         return eigenvectors[:, idx[:L]]
     else:
         # Match R: initial_v <- qnorm(1:(ncol(C)+1) / (ncol(C)+1))[1:ncol(C)]
@@ -79,11 +94,267 @@ def _pca_projection(C, L):
 
         eigenvalues, eigenvectors = eigsh(C, k=L, which='LM', v0=v0,
                                           maxiter=1000)
-        idx = np.argsort(eigenvalues)[::-1]
+        idx = np.argsort(np.abs(eigenvalues))[::-1]
         return eigenvectors[:, idx]
 
 
-def _get_major_eigenvalue(C, L):
+# --- Hartigan-Wong (AS 136, 1979) port -------------------------------------
+#
+# Translation of R's ``src/library/stats/src/kmns.f`` (KMNS + OPTRA + QTRAN).
+# The cross-referenced Rust port at ``ddrtree-core/src/init.rs:153-815`` was
+# used as a clean reference. This implementation is **NumPy + numba-optional**
+# and reproduces R `stats::kmeans(..., algorithm="Hartigan-Wong")` to
+# accumulated FP error on the same seed centers.
+#
+# R-parity contract — DDRTree.R:151 calls ``kmeans(t(Z), K, centers=centers)``.
+# Because ``centers=`` is matched by name and ``K`` is positional, R's partial
+# matching binds ``K`` to the next open formal (``iter.max``). So the HW outer
+# iteration cap is **K, not R's default 10**. We must replicate that.
+
+_HW_BIG = 1.0e30
+_HW_QTRAN_STEP_MULTIPLIER = 50  # R's iMaxQtr = 50 * N
+
+
+@njit(cache=True)
+def _hw_initial_assignments(z, centers, ic1, ic2):
+    """kmns.f lines 41-75: initial nearest / second-nearest assignment."""
+    d, n = z.shape
+    k = centers.shape[0]
+    for i in range(n):
+        ic1[i] = 0
+        ic2[i] = 1
+        dt1 = 0.0
+        dt2 = 0.0
+        for j in range(d):
+            a = z[j, i] - centers[0, j]; dt1 += a * a
+            b = z[j, i] - centers[1, j]; dt2 += b * b
+        if dt1 > dt2:  # strict > preserves cluster-0 on ties (kmns.f line 51)
+            ic1[i] = 1; ic2[i] = 0
+            dt1, dt2 = dt2, dt1
+        for l in range(2, k):
+            db = 0.0
+            completed = True
+            for j in range(d):
+                delta = z[j, i] - centers[l, j]
+                db += delta * delta
+                if db >= dt2:  # early abandon (kmns.f line 63)
+                    completed = False
+                    break
+            if not completed:
+                continue
+            if db >= dt1:
+                dt2 = db; ic2[i] = l
+            else:
+                dt2 = dt1; ic2[i] = ic1[i]
+                dt1 = db; ic1[i] = l
+
+
+@njit(cache=True)
+def _hw_transfer(z, centers, point, src, dst, nc, an1, an2):
+    """Move point ``point`` from cluster ``src`` to ``dst``. kmns.f 297-311."""
+    al1 = float(nc[src]); alw = al1 - 1.0
+    al2 = float(nc[dst]); alt = al2 + 1.0
+    for j in range(z.shape[0]):
+        centers[src, j] = (centers[src, j] * al1 - z[j, point]) / alw
+        centers[dst, j] = (centers[dst, j] * al2 + z[j, point]) / alt
+    nc[src] -= 1
+    nc[dst] += 1
+    an2[src] = alw / al1
+    an1[src] = (alw / (alw - 1.0)) if alw > 1.0 else _HW_BIG
+    an1[dst] = alt / al2
+    an2[dst] = alt / (alt + 1.0)
+
+
+@njit(cache=True)
+def _hw_optra(z, centers, ic1, ic2, nc, an1, an2, ncp, dists, itran, live, indx_arr):
+    """OPTRA pass — kmns.f 204-329. ``indx_arr`` is a length-1 array used as
+    a mutable scalar so numba can write through it."""
+    d, n = z.shape
+    k = centers.shape[0]
+    m_clock = n
+    for c in range(k):
+        if itran[c] == 1:
+            live[c] = m_clock + 1
+    for i in range(n):
+        i_clock = i + 1
+        indx_arr[0] += 1
+        l1 = ic1[i]; ll = ic2[i]; l2 = ll
+        if nc[l1] != 1:
+            if ncp[l1] != 0:
+                acc = 0.0
+                for j in range(d):
+                    delta = z[j, i] - centers[l1, j]
+                    acc += delta * delta
+                dists[i] = acc * an1[l1]
+            r2 = 0.0
+            for j in range(d):
+                delta = z[j, i] - centers[l2, j]
+                r2 += delta * delta
+            r2 *= an2[l2]
+            for l in range(k):
+                if (i_clock >= live[l1] and i_clock >= live[l]) or l == l1 or l == ll:
+                    continue
+                limit = r2 / an2[l]
+                dc = 0.0
+                completed = True
+                for j in range(d):
+                    delta = z[j, i] - centers[l, j]
+                    dc += delta * delta
+                    if dc >= limit:
+                        completed = False
+                        break
+                if completed:
+                    r2 = dc * an2[l]
+                    l2 = l
+            if r2 >= dists[i]:
+                ic2[i] = l2
+            else:
+                indx_arr[0] = 0
+                live[l1] = m_clock + i_clock
+                live[l2] = m_clock + i_clock
+                ncp[l1] = i_clock
+                ncp[l2] = i_clock
+                _hw_transfer(z, centers, i, l1, l2, nc, an1, an2)
+                ic1[i] = l2; ic2[i] = l1
+        if indx_arr[0] == m_clock:
+            return
+    for c in range(k):
+        itran[c] = 0
+        live[c] -= m_clock
+
+
+@njit(cache=True)
+def _hw_qtran(z, centers, ic1, ic2, nc, an1, an2, ncp, dists, itran,
+              indx_arr, max_qtr):
+    """QTRAN pass — kmns.f 332-448. Returns 0 if iMaxQtr exhausted, else 1."""
+    d, n = z.shape
+    m_clock = n
+    icoun = 0
+    istep = 0
+    while True:
+        for i in range(n):
+            icoun += 1
+            istep += 1
+            if istep >= max_qtr:
+                return 0
+            l1 = ic1[i]; l2 = ic2[i]
+            if nc[l1] != 1:
+                if istep <= ncp[l1]:
+                    acc = 0.0
+                    for j in range(d):
+                        delta = z[j, i] - centers[l1, j]
+                        acc += delta * delta
+                    dists[i] = acc * an1[l1]
+                if istep < ncp[l1] or istep < ncp[l2]:
+                    limit = dists[i] / an2[l2]
+                    dc = 0.0
+                    completed = True
+                    for j in range(d):
+                        delta = z[j, i] - centers[l2, j]
+                        dc += delta * delta
+                        if dc >= limit:
+                            completed = False
+                            break
+                    if completed:
+                        icoun = 0
+                        indx_arr[0] = 0
+                        itran[l1] = 1
+                        itran[l2] = 1
+                        ncp[l1] = istep + m_clock
+                        ncp[l2] = istep + m_clock
+                        _hw_transfer(z, centers, i, l1, l2, nc, an1, an2)
+                        ic1[i] = l2; ic2[i] = l1
+            if icoun == m_clock:
+                return 1
+
+
+def _kmeans_hw(z, seed_centers, iter_max):
+    """Hartigan-Wong AS 136. Inputs/outputs match R `stats::kmeans` semantics.
+
+    Parameters
+    ----------
+    z : (d, n) float64 — same orientation as ``t(Z)`` in R, **transposed
+        relative to scikit's API**. Columns are points.
+    seed_centers : (k, d) float64 — each row is a seed center, matching R's
+        ``centers`` argument (which is row-major (k, d)).
+    iter_max : int — OPTRA outer cap. **For DDRTree this must be ``K``**, not
+        10, because of R's partial-matching trap at DDRTree.R:151.
+
+    Returns
+    -------
+    centers : (k, d) float64 — post-iteration cluster means.
+    """
+    z = np.ascontiguousarray(z, dtype=np.float64)
+    centers = np.ascontiguousarray(seed_centers, dtype=np.float64).copy()
+    d, n = z.shape
+    k = centers.shape[0]
+    if k == 0:
+        return np.zeros((0, d), dtype=np.float64)
+    if n == 0 or k == 1:
+        if k == 1 and n > 0:
+            return z.mean(axis=1, keepdims=True).T.copy()
+        return centers
+
+    ic1 = np.zeros(n, dtype=np.int64)
+    ic2 = np.zeros(n, dtype=np.int64)
+    _hw_initial_assignments(z, centers, ic1, ic2)
+
+    nc = np.zeros(k, dtype=np.int64)
+    for i in range(n):
+        nc[ic1[i]] += 1
+    any_empty = bool((nc == 0).any())
+
+    # Cluster-mean recompute (kmns.f 77-104). Empty clusters keep seed row.
+    means = np.zeros((k, d), dtype=np.float64)
+    for i in range(n):
+        means[ic1[i]] += z[:, i]
+    for c in range(k):
+        if nc[c] == 0:
+            means[c] = centers[c]
+        else:
+            means[c] /= nc[c]
+    centers = means
+    if any_empty:
+        return centers
+
+    an1 = np.full(k, _HW_BIG, dtype=np.float64)
+    an2 = np.zeros(k, dtype=np.float64)
+    ncp = np.full(k, -1, dtype=np.int64)
+    itran = np.ones(k, dtype=np.int64)
+    live = np.zeros(k, dtype=np.int64)
+    dists = np.zeros(n, dtype=np.float64)
+    for c in range(k):
+        cnt = float(nc[c])
+        an2[c] = cnt / (cnt + 1.0)
+        if cnt > 1.0:
+            an1[c] = cnt / (cnt - 1.0)
+
+    indx_arr = np.zeros(1, dtype=np.int64)  # shared across OPTRA invocations
+    max_qtr = _HW_QTRAN_STEP_MULTIPLIER * n
+    for _ in range(iter_max):
+        _hw_optra(z, centers, ic1, ic2, nc, an1, an2, ncp, dists,
+                  itran, live, indx_arr)
+        if indx_arr[0] == n:
+            break
+        qtran_ok = _hw_qtran(z, centers, ic1, ic2, nc, an1, an2, ncp, dists,
+                             itran, indx_arr, max_qtr)
+        if qtran_ok == 0 or k == 2:
+            break
+        ncp.fill(0)
+
+    # Final centroid recompute (kmns.f 175-198).
+    final = np.zeros((k, d), dtype=np.float64)
+    for i in range(n):
+        final[ic1[i]] += z[:, i]
+    for c in range(k):
+        if nc[c] == 0:
+            final[c] = centers[c]
+        else:
+            final[c] /= nc[c]
+    return final
+
+
+def _get_major_eigenvalue(C, L, compat=True):
     """Top squared singular value of ``C`` (D×N).
 
     DDRTree's objective uses this as ``||X - WZ||_2^2``. We use
@@ -102,6 +373,13 @@ def _get_major_eigenvalue(C, L):
     L : int
         Number of dimensions (kept for API compatibility; only the
         top singular value is needed for DDRTree's termination check).
+    compat : bool, default True
+        When True, clamp the returned σ₁ to ≤ 1.0 to mimic R's IRLBA
+        ``max(abs(eigen_res$v))`` bound at DDRTree.R:40 (an upstream bug —
+        the IRLBA right-singular vector is unit-norm so its max-abs entry
+        is ≤ 1, then squared by DDRTree.cpp:349-352). Set False for the
+        mathematically correct ‖X − WZ‖₂ residual. Defaults to True so the
+        ``objective_vals`` trajectory matches R's published values.
     """
     C = np.ascontiguousarray(C)
     D, N = C.shape
@@ -124,9 +402,9 @@ def _get_major_eigenvalue(C, L):
                 return 0.0
             u_new /= s
             if abs(s - prev) <= 1e-6 * s:
-                return float(s)
+                return float(min(s, 1.0)) if compat else float(s)
             prev, u = s, u_new
-        return float(s)
+        return float(min(s, 1.0)) if compat else float(s)
     else:
         v = rng.standard_normal(N)
         v /= np.linalg.norm(v)
@@ -139,15 +417,110 @@ def _get_major_eigenvalue(C, L):
                 return 0.0
             v_new /= s
             if abs(s - prev) <= 1e-6 * s:
-                return float(s)
+                return float(min(s, 1.0)) if compat else float(s)
             prev, v = s, v_new
-        return float(s)
+        return float(min(s, 1.0)) if compat else float(s)
+
+
+def _build_center_mst_nn(Y, N):
+    """Final weighted MST on the K centers, embedded in an (N, N) sparse matrix.
+
+    Mirrors ``DDRTree.cpp:528-539``: the returned ``stree`` is
+    ``(N_cells, N_cells)`` but only the top-left ``(K, K)`` center block is
+    populated. The matrix is symmetric; entries are the squared Euclidean
+    distances between MST-linked centers (``_sqdist(Y, Y)``).
+
+    Shared by the pure-Python path and the ``fastddrtree`` backend so both
+    return a byte-for-byte identical ``stree`` construction for the same ``Y``.
+    """
+    distsqMU = _sqdist(Y, Y)
+    dist_dense = distsqMU.copy()
+    np.fill_diagonal(dist_dense, 0)
+    mst_KK = minimum_spanning_tree(csr_matrix(dist_dense))  # (K, K)
+    mst_KK_sym = mst_KK + mst_KK.T
+    mst_KK_coo = mst_KK_sym.tocoo()
+    return _sparse.coo_matrix(
+        (mst_KK_coo.data, (mst_KK_coo.row, mst_KK_coo.col)),
+        shape=(N, N),
+    ).tocsr()
+
+
+def _ddrtree_fastddrtree(X, *, dimensions, maxIter, sigma, lambda_param,
+                         ncenter, param_gamma, tol, verbose, random_state,
+                         method='fast', pca_method='irlba', initial_method=None):
+    """Dispatch DDRTree to the optional Rust ``fastddrtree`` backend.
+
+    The Rust core is R-parity (HSMM seed=42 procrustes ≈ 4e-14 vs R Monocle 2
+    on a C-contiguous input), so its output matches the ``'exact'`` Python path.
+    ``method`` and ``pca_method`` select Python-only optimisation strategies and
+    are therefore ignored here; a custom ``initial_method`` cannot be honoured
+    (the Rust core always initialises ``W`` via PCA) and raises.
+
+    Returns the same 5-key dict contract as the pure-Python ``DDRTree``.
+    """
+    # Validate unsupported config before attempting the optional import, so the
+    # error is actionable regardless of whether fastddrtree is installed.
+    if initial_method is not None:
+        raise ValueError(
+            "backend='fastddrtree' does not support a custom initial_method; "
+            "the Rust core always initialises W via PCA. Use backend='python' "
+            "for custom initialisation."
+        )
+
+    try:
+        import fastddrtree
+    except ImportError as exc:
+        raise ImportError(
+            "backend='fastddrtree' requires the optional 'fastddrtree' package "
+            "(Rust DDRTree core via pyo3). Install a prebuilt wheel with "
+            "`pip install fastddrtree`, or build it locally with "
+            "`maturin develop --release` from crates/ddrtree-py."
+        ) from exc
+
+    # The pyo3 binding reads X through a zero-copy C-contiguous slice and
+    # rejects non-C-contiguous (e.g. Fortran-order) input — silently mis-reading
+    # a Fortran-order buffer as C-order scrambles the matrix. Guarantee layout.
+    X = np.ascontiguousarray(X, dtype=np.float64)
+
+    # Match the pure-Python DDRTree contract exactly:
+    #   * ncenter=None means K=N (every cell is a center). The Rust core would
+    #     otherwise auto-select K=cal_ncenter(N) for N>=100 (ddrtree-core
+    #     init.rs), so pass N explicitly to keep backend='fastddrtree' a
+    #     transparent swap for backend='python'.
+    #   * random_state=None is allowed by reduce_dimension's documented API;
+    #     map it to the shared default seed (2016) instead of crashing on
+    #     int(None). The Python path is deterministic and ignores the seed.
+    ncenter_eff = X.shape[1] if ncenter is None else ncenter
+    seed_eff = 2016 if random_state is None else int(random_state)
+
+    result = fastddrtree.fit(
+        X,
+        dimensions=dimensions,
+        max_iter=maxIter,
+        sigma=sigma,
+        ncenter=ncenter_eff,
+        lambda_param=lambda_param,
+        param_gamma=float(param_gamma),
+        tol=tol,
+        verbose=verbose,
+        random_seed=seed_eff,
+    )
+
+    Y = np.ascontiguousarray(result['Y'])
+    stree = _build_center_mst_nn(Y, X.shape[1])
+    return {
+        'W': result['W'],
+        'Z': result['Z'],
+        'Y': Y,
+        'stree': stree,
+        'objective_vals': list(result['objective_vals']),
+    }
 
 
 def DDRTree(X, dimensions=2, initial_method=None, maxIter=20, sigma=0.001,
             lambda_param=None, ncenter=None, param_gamma=10, tol=0.001,
             verbose=False, pca_method='irlba', random_state=2016,
-            method='fast'):
+            method='fast', backend='python'):
     """
     Perform DDRTree dimensionality reduction.
 
@@ -168,6 +541,13 @@ def DDRTree(X, dimensions=2, initial_method=None, maxIter=20, sigma=0.001,
         evaluating the full objective (including ``||X - WZ||_2^2``)
         on every iteration.  Use this when bitwise agreement with R
         is required.
+    backend : {'python', 'fastddrtree'}, default 'python'
+        ``'python'`` runs the pure-Python implementation in this module.
+        ``'fastddrtree'`` dispatches to the optional Rust core (pyo3 binding,
+        ``pip install fastddrtree``), which is R-parity and typically faster.
+        With ``'fastddrtree'`` the ``method``/``pca_method`` options are ignored
+        (the Rust core uses its own R-faithful update path) and a custom
+        ``initial_method`` raises ``ValueError``.
     X : np.ndarray, shape (D, N)
         Input data matrix (genes x cells), already preprocessed.
     dimensions : int
@@ -195,10 +575,38 @@ def DDRTree(X, dimensions=2, initial_method=None, maxIter=20, sigma=0.001,
         W : (D, dimensions) projection matrix
         Z : (dimensions, N) reduced coordinates of cells
         Y : (dimensions, K) center positions in reduced space
-        stree : (K, K) sparse MST adjacency (weighted)
+        stree : (N, N) sparse MST adjacency (weighted, symmetric). Entries are
+            populated only in the top-left (K, K) block — matches
+            ``DDRTree.cpp:538`` which allocates ``SpMat(N_cells, N_cells)``.
         objective_vals : list of objective function values
     """
+    # Dtype + finiteness validation. R/C++ DDRTree runs everything in double;
+    # silent float32 promotion in BLAS paths can shift Cholesky and eigsh
+    # results by O(1e-5), which compounds across iterations. NaN/Inf in X
+    # would cascade through min, exp, Cholesky, and MST with no diagnostic.
+    X = np.asarray(X)
+    if X.dtype != np.float64:
+        X = np.ascontiguousarray(X, dtype=np.float64)
+    else:
+        X = np.ascontiguousarray(X)
+    if not np.all(np.isfinite(X)):
+        raise ValueError(
+            "X contains non-finite values (NaN/Inf); DDRTree requires a "
+            "finite float64 matrix."
+        )
     D, N = X.shape
+
+    if backend == 'fastddrtree':
+        return _ddrtree_fastddrtree(
+            X, dimensions=dimensions, maxIter=maxIter, sigma=sigma,
+            lambda_param=lambda_param, ncenter=ncenter, param_gamma=param_gamma,
+            tol=tol, verbose=verbose, random_state=random_state,
+            method=method, pca_method=pca_method, initial_method=initial_method,
+        )
+    if backend != 'python':
+        raise ValueError(
+            f"backend must be 'python' or 'fastddrtree', got {backend!r}"
+        )
 
     # PCA initialization for W — cache XXT so the fast-mode inner loop
     # can reuse it instead of recomputing ``Q @ X.T`` (D²·N) every
@@ -221,13 +629,15 @@ def DDRTree(X, dimensions=2, initial_method=None, maxIter=20, sigma=0.001,
         K = ncenter
         if K > Z.shape[1]:
             raise ValueError("ncenter must be <= number of cells")
-        # Sample evenly spaced points as initial centers
+        # R: centers = t(Z)[seq(1, ncol(Z), length.out=K), ]  — evenly spaced
+        # indices, 1-based. np.linspace with dtype=int truncates (floor for
+        # nonneg), matching `as.integer(seq(...))` semantics.
         indices = np.linspace(0, Z.shape[1] - 1, K, dtype=int)
-        centers = Z[:, indices].T
-        kmeans = KMeans(n_clusters=K, init=centers, n_init=1, max_iter=100,
-                         random_state=random_state)
-        kmeans.fit(Z.T)
-        Y = kmeans.cluster_centers_.T
+        seed_centers = Z[:, indices].T              # (K, dim)
+        # R kmeans(t(Z), K, centers=centers) — `K` positional binds iter.max
+        # via partial matching. So HW outer cap = K, not 10. See _kmeans_hw.
+        Y_kd = _kmeans_hw(Z, seed_centers, iter_max=K)
+        Y = Y_kd.T                                  # (dim, K)
 
     if lambda_param is None:
         lambda_param = 5.0 * N
@@ -303,7 +713,7 @@ def DDRTree(X, dimensions=2, initial_method=None, maxIter=20, sigma=0.001,
             x1 = np.log(np.exp(-tmp_distZY / sigma).sum(axis=1))
             obj1 = -sigma * (x1 - min_dist.flatten() / sigma).sum()
             try:
-                major_ev = _get_major_eigenvalue(X - W @ Z, dimensions)
+                major_ev = _get_major_eigenvalue(X - W @ Z, dimensions, compat=True)
             except Exception:
                 major_ev = np.linalg.norm(X - W @ Z, ord=2)
             obj2 = major_ev ** 2
@@ -505,13 +915,12 @@ def DDRTree(X, dimensions=2, initial_method=None, maxIter=20, sigma=0.001,
         except np.linalg.LinAlgError:
             Y = np.linalg.solve(A_Y, (Z @ R).T).T
 
-    # Build final MST with weights
-    distsqMU = _sqdist(Y, Y)
-    dist_dense = distsqMU.copy()
-    np.fill_diagonal(dist_dense, 0)
-    mst_sparse = minimum_spanning_tree(csr_matrix(dist_dense))
-    # Make symmetric
-    stree = mst_sparse + mst_sparse.T
+    # Build final MST with weights. Per DDRTree.cpp:528-539, the returned
+    # ``stree`` is a sparse (N, N) — NOT (K, K) — matrix populated only at
+    # center-pair positions. Downstream Monocle 2 consumers (e.g. the
+    # ``project2MST`` helper) index ``stree`` with cell indices and expect
+    # the larger shape.
+    stree = _build_center_mst_nn(Y, N)
 
     return {
         'W': W,
